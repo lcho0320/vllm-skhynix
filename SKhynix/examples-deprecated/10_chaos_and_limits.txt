@@ -1,0 +1,152 @@
+10 — Chaos and limit testing.
+=============================
+
+Reference notes for failure testing. Each scenario is described so you can run
+it deliberately, one at a time.
+
+For a runnable version that executes a single named scenario against a server,
+run:
+
+    python 10_chaos_and_limits.py --list
+    python 10_chaos_and_limits.py --scenario startup-oom
+
+You already ran the two most instructive experiments by accident:
+  - asked for more memory than existed and watched EngineCore refuse to start
+  - killed a container and watched kubelet resurrect it
+
+This file turns that into a deliberate checklist. For data-center work these
+failure behaviors matter more than peak throughput, because they determine what
+happens at 3am.
+
+Run scenarios one at a time against a server you can afford to break.
+
+======================================================================
+10 — Chaos and limit testing
+======================================================================
+model: $MODEL   port: $PORT
+
+----------------------------------------------------------------------
+SCENARIO 1 — Memory exhaustion at startup (you have seen this one)
+----------------------------------------------------------------------
+  vllm serve $MODEL --gpu-memory-utilization 0.99
+
+Expected: ValueError from request_memory() in vllm/v1/worker/utils.py, engine
+core dies, process exits nonzero.
+
+What to verify:
+  - does it fail FAST and LOUDLY? (yes — good, this is a clean failure)
+  - in k8s, does the pod CrashLoopBackOff rather than sit half-alive? (it should)
+  - does /health ever return 200 before the engine is ready? (it must not, or
+    k8s routes traffic to a pod that cannot serve)
+
+----------------------------------------------------------------------
+SCENARIO 2 — Memory exhaustion DURING serving (the nastier one)
+----------------------------------------------------------------------
+Start with a large budget, then create pressure from outside:
+
+  # terminal A
+  vllm serve $MODEL --gpu-memory-utilization 0.45 --port $PORT
+
+  # terminal B — consume the shared pool from the host side.
+  # On GB10 this is unusually easy precisely because memory is unified.
+  python -c "
+import torch, time
+x = torch.zeros(int(30e9 // 2), dtype=torch.float16, device='cuda')
+print('holding 30 GiB'); time.sleep(300)
+"
+
+What to verify:
+  - vLLM does NOT crash (its cache is pre-allocated at startup — this is the
+    point of pre-allocation)
+  - a NEW replica cannot start while the pressure exists
+  - -> operational lesson: vLLM is resilient to memory pressure once running,
+       and fragile to it at startup. Rollouts are therefore the dangerous window.
+
+----------------------------------------------------------------------
+SCENARIO 3 — KV cache exhaustion and preemption
+----------------------------------------------------------------------
+Force the scheduler past its cache with long contexts and high concurrency:
+
+  vllm serve $MODEL --gpu-memory-utilization 0.20 \
+    --max-model-len 2048 --max-num-seqs 512 --port $PORT
+
+  vllm bench serve --backend vllm --model $MODEL --port $PORT \
+    --dataset-name random --random-input-len 1536 --random-output-len 512 \
+    --num-prompts 400 --request-rate inf
+
+Watch the server log for "Preempted" / preemption counts.
+
+What to verify:
+  - throughput CLIFF, not a crash (graceful degradation — correct behavior)
+  - p99 latency explodes while p50 stays reasonable (classic preemption signature)
+  - vllm:num_preemptions_total in /metrics rises
+  -> alert on preemption rate. It is the leading indicator of undersized cache.
+
+----------------------------------------------------------------------
+SCENARIO 4 — Engine core death
+----------------------------------------------------------------------
+  pkill -f "VLLM::EngineCore"
+
+What to verify:
+  - the API server notices and stops serving (it must not accept requests it
+    cannot fulfil)
+  - in-flight requests fail cleanly with 5xx, not a hang
+  - /health goes unhealthy so k8s restarts the pod
+  - measure TIME TO DETECTION — this is your worst-case blackhole window, and it
+    is what liveness probe periodSeconds should be tuned against
+
+----------------------------------------------------------------------
+SCENARIO 5 — Request-level abuse
+----------------------------------------------------------------------
+  # over-long context: should be rejected with 400, not OOM
+  curl -s localhost:$PORT/v1/completions -H 'Content-Type: application/json' \
+    -d '{"model":"$MODEL","prompt":"'"$(python -c 'print("word "*100000)')"'","max_tokens":16}' \
+    | head -c 400
+
+  # huge max_tokens
+  curl -s localhost:$PORT/v1/completions -H 'Content-Type: application/json' \
+    -d '{"model":"$MODEL","prompt":"hi","max_tokens":1000000}' | head -c 400
+
+  # client disconnect mid-stream — does the server free the KV blocks?
+  timeout 1 curl -N -s localhost:$PORT/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"$MODEL","prompt":"long story:","max_tokens":4096,"stream":true}'
+  # then check num_requests_running returns to baseline in /metrics
+
+What to verify: every one of these is a clean 4xx or a clean cancellation. Any of
+them causing OOM or a leak is a denial-of-service vector in a multi-tenant service.
+
+----------------------------------------------------------------------
+SCENARIO 6 — Kubernetes-level behavior (single-node cluster on this box)
+----------------------------------------------------------------------
+  export KC="sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl"
+
+  $KC get deploy -n llm-inference
+  $KC delete pod -n llm-inference -l app=sglang-phi     # pod deletion -> respawn
+  $KC scale deploy sglang-phi -n llm-inference --replicas=0   # the real off switch
+
+What to verify:
+  - deleting a POD -> ReplicaSet recreates it (desired state unchanged)
+  - scaling the DEPLOYMENT to 0 -> stays down (desired state changed)
+  - crictl stop -> kubelet restarts the container, same pod, ATTEMPT increments
+  -> this is the lesson from your abandoned-deployment hunt: fight the desired
+     state, not the process.
+
+  Measure cold-start time, since it bounds how fast you can scale out:
+    time ($KC scale deploy vllm-qwen -n llm-inference --replicas=1 && \
+          $KC wait --for=condition=ready pod -l app=vllm-qwen -n llm-inference --timeout=600s)
+
+----------------------------------------------------------------------
+SCENARIO 7 — Idle-detection (the 37-day problem)
+----------------------------------------------------------------------
+Both abandoned deployments passed health checks for 37 days while doing zero
+work. Build the detection you wish had existed:
+
+  # health-check traffic vs real traffic
+  curl -s localhost:$PORT/metrics | grep -E \
+    'vllm:num_requests_running|vllm:num_requests_waiting|vllm:prompt_tokens_total|vllm:generation_tokens_total'
+
+An idle-but-healthy service has generation_tokens_total FLAT while /health keeps
+returning 200. Alert on "GPU memory reserved > X AND generation_tokens_total rate
+== 0 for N hours". That single alert would have caught both pods and freed
+40 GiB — and it generalizes to every model server in a fleet.

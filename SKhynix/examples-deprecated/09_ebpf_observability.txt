@@ -1,0 +1,199 @@
+09 — eBPF observability for vLLM.
+=================================
+
+Reference notes for eBPF tracing of vLLM. Each recipe is a bpftrace program you
+can paste into a root shell.
+
+For a runnable version that attaches a chosen probe for a fixed duration, run:
+
+    sudo python 09_ebpf_observability.py --list
+    sudo python 09_ebpf_observability.py --recipe page-faults --seconds 10
+
+THE HONEST ANSWER ON THE eBPF/vLLM TIE-IN
+------------------------------------------
+vLLM contains no eBPF code and exposes no eBPF hooks. There is no direct
+integration and there will not be one. The tie-in is real but it is entirely
+at the layer BELOW and AROUND vLLM, and it is genuinely useful for the job you
+are describing (running this as data-center infrastructure).
+
+What eBPF CAN see for an LLM serving stack:
+  - syscalls the engine makes: ioctl to the NVIDIA driver, mmap during weight
+    load, futex contention between the API server and engine core processes
+  - network: TCP accept/retransmit/latency between client -> API server ->
+    engine, and pod-to-pod flow if you run Cilium
+  - block I/O: reading 263 GB of safetensors off disk at model load
+  - scheduler: CPU run-queue delay for the engine's Python threads, which
+    shows up as unexplained ITL jitter
+  - page faults: on GB10 specifically, because unified memory means host memory
+    pressure and GPU memory pressure are the SAME pressure
+
+What eBPF CANNOT see:
+  - anything inside the GPU. CUDA kernel execution, SM occupancy, tensor core
+    utilization, HBM bandwidth — all invisible. eBPF stops at the driver
+    boundary. For inside-the-GPU telemetry you need NSight, CUPTI, or DCGM.
+
+So the division of labor is:
+  DCGM / nvidia-smi   -> GPU-side truth
+  vLLM /metrics       -> engine-side truth (queue depth, KV usage, TTFT)
+  eBPF                -> everything between the network card and the driver,
+                         which is where "the GPU looks idle but latency is bad"
+                         problems actually live
+
+Verified available on this box: bpftrace v0.20.2, BTF at /sys/kernel/btf/vmlinux,
+kernel 6.14.0-1013-nvidia.
+
+  sudo bpftrace -e '<one of the programs below>'
+
+All of these need root. Run vLLM in one terminal, bpftrace in another.
+
+======================================================================
+09 — eBPF observability for vLLM
+======================================================================
+
+Start a server first, in another terminal:
+
+  source /home/leeksun/testingEnvironment/vLLM_testing/vllm/.venv/bin/activate
+  vllm serve facebook/opt-125m --gpu-memory-utilization 0.30 --port 8000
+
+Then find the engine PIDs:
+
+  pgrep -af "VLLM::EngineCore|vllm serve"
+
+----------------------------------------------------------------------
+1. NVIDIA DRIVER IOCTL RATE  — how the process talks to the GPU
+----------------------------------------------------------------------
+Every CUDA operation that crosses into the driver becomes an ioctl. The RATE and
+LATENCY of these is a proxy for how hard the engine is driving the GPU, and a
+spike in ioctl latency with flat GPU utilization means driver-side contention
+(often another process, or memory pressure).
+
+  sudo bpftrace -e '
+  tracepoint:syscalls:sys_enter_ioctl
+  /comm == "VLLM::EngineCor" || comm == "pt_main_thread"/
+  { @start[tid] = nsecs; @count = count(); }
+
+  tracepoint:syscalls:sys_exit_ioctl
+  /@start[tid]/
+  { @ioctl_us = hist((nsecs - @start[tid]) / 1000); delete(@start[tid]); }
+
+  interval:s:5 { print(@count); clear(@count); }
+  '
+
+Read it as: @count is ioctls per 5s; @ioctl_us is the latency histogram. A long
+tail above ~1ms usually means you are queueing on the driver, not computing.
+
+----------------------------------------------------------------------
+2. PAGE FAULTS  — the GB10-specific one
+----------------------------------------------------------------------
+This matters far more on GB10 than on a discrete-GPU box. Unified memory means
+host RAM and GPU memory are the same 119.7 GiB pool, so host memory pressure
+directly costs you KV cache. Major faults during serving mean you are paging,
+and inference latency will be unpredictable.
+
+  sudo bpftrace -e '
+  software:major-faults:1 { @major[comm] = count(); }
+  software:minor-faults:1 { @minor[comm] = count(); }
+  interval:s:10 {
+    printf("--- major faults (should be ~0 while serving) ---\n");
+    print(@major); clear(@major);
+    clear(@minor);
+  }
+  '
+
+If @major is nonzero for the vLLM process while serving, lower
+gpu_memory_utilization — you have squeezed the host.
+
+----------------------------------------------------------------------
+3. MODEL LOAD I/O  — why cold start takes as long as it does
+----------------------------------------------------------------------
+Cold-start time is an autoscaling parameter: a replica is useless until weights
+are resident. This shows where the time goes when loading safetensors.
+
+  sudo bpftrace -e '
+  tracepoint:block:block_rq_issue { @bytes = sum(args->bytes); @reqs = count(); }
+  interval:s:2 {
+    printf("read %8d MB/s  %6d reqs/s\n", @bytes / 1024 / 1024 / 2, @reqs / 2);
+    clear(@bytes); clear(@reqs);
+  }
+  '
+
+Run this while starting a large model. Compare observed MB/s against the device's
+rated throughput — if you are well under, the bottleneck is not the disk and
+model load is CPU-bound on deserialization instead.
+
+----------------------------------------------------------------------
+4. TCP ACCEPT + REQUEST ARRIVAL  — separating queueing from inference
+----------------------------------------------------------------------
+vLLM's own metrics start counting when the engine sees the request. eBPF sees it
+when the KERNEL sees it. The gap between the two is time lost in the API server /
+event loop, and it is invisible from inside vLLM.
+
+  sudo bpftrace -e '
+  kprobe:tcp_v4_connect { @connects[comm] = count(); }
+  kretprobe:inet_csk_accept { @accepts = count(); }
+  interval:s:5 { print(@accepts); clear(@accepts); print(@connects); clear(@connects); }
+  '
+
+----------------------------------------------------------------------
+5. RUN-QUEUE LATENCY  — CPU starvation showing up as ITL jitter
+----------------------------------------------------------------------
+The engine's Python threads must be scheduled promptly to launch the next decode
+step. If the host is oversubscribed, steps are delayed and users see it as
+inter-token latency variance with the GPU sitting idle.
+
+  sudo bpftrace -e '
+  tracepoint:sched:sched_wakeup { @qtime[args->pid] = nsecs; }
+  tracepoint:sched:sched_switch
+  /@qtime[args->next_pid]/
+  {
+    @runq_delay_us = hist((nsecs - @qtime[args->next_pid]) / 1000);
+    delete(@qtime[args->next_pid]);
+  }
+  interval:s:10 { print(@runq_delay_us); clear(@runq_delay_us); }
+  '
+
+Healthy: mass under ~100us. A tail into milliseconds while serving means the CPU
+side is your bottleneck, not the GPU.
+
+----------------------------------------------------------------------
+6. OFF-CPU TIME FOR THE ENGINE  — what is it waiting ON
+----------------------------------------------------------------------
+  sudo bpftrace -e '
+  kprobe:finish_task_switch /comm == "VLLM::EngineCor"/ { @off[kstack] = count(); }
+  interval:s:15 { print(@off, 5); clear(@off); }
+  '
+
+Prints the top 5 kernel stacks where the engine blocks. Expect futex (IPC with
+the API server process) and GPU driver waits. Anything else is worth explaining.
+
+----------------------------------------------------------------------
+WHERE THIS FITS IN A REAL DATA CENTER
+----------------------------------------------------------------------
+Ad-hoc bpftrace is for root-causing. For fleet-wide continuous telemetry the
+production-grade eBPF projects are:
+
+  Cilium + Hubble   eBPF CNI. Replaces Calico (which this cluster runs). Gives
+                    L3-L7 flow visibility between services with no sidecar, so
+                    you can attribute latency to network vs inference. The most
+                    directly relevant one if you serve multiple models behind a
+                    router or run disaggregated prefill/decode across nodes.
+  Pixie             auto-instruments HTTP/gRPC via eBPF, no code changes. Gives
+                    per-endpoint latency for the OpenAI API surface for free.
+  Parca / Pyroscope continuous profiling. Finds CPU time in the Python scheduler
+                    loop, tokenizer, and detokenizer — all real vLLM bottlenecks
+                    that GPU metrics never show.
+  Kepler            per-pod energy attribution via eBPF + RAPL. Relevant if your
+                    remit includes power and cost per token, which at rack scale
+                    it usually does.
+  bpftop / bpfilter runtime overhead accounting for the eBPF programs themselves.
+
+A SUGGESTED LEARNING PATH THAT MATCHES YOUR JOB
+  1. bpftrace one-liners (this file) — get fluent on syntax and probe types
+  2. "BPF Performance Tools" (Gregg) ch. 6 CPU, 8 filesystems, 10 networking
+  3. Then Cilium/Hubble on this single-node cluster — it is a realistic place to
+     learn it because you own the whole control plane
+  4. Only then bpf CO-RE / libbpf if you want to write custom collectors
+
+Sequence it AFTER vLLM fundamentals. eBPF answers "why is this slow" — it is
+much more useful once you already know what normal looks like, which examples
+02/03/08 teach you.

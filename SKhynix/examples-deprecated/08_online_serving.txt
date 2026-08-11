@@ -1,0 +1,146 @@
+08 — Online serving: the OpenAI-compatible server and real benchmarks.
+======================================================================
+
+Reference notes for online serving. Every command below is meant to be run by
+hand in your own terminal.
+
+For an automated version that starts a server, exercises it and tears it down
+again, run:
+
+    python 08_online_serving.py
+
+Offline LLM.generate() measures throughput on a fixed batch. That is NOT how
+production behaves. Real serving is an open system: requests arrive at some
+rate independent of whether you can keep up, and the metrics that matter are
+per-request latency percentiles, not aggregate tokens/sec.
+
+  TTFT  time to first token   — dominated by prefill + queueing
+  ITL   inter-token latency   — dominated by decode step time + batch size
+  E2E   end-to-end latency
+
+---------------------------------------------------------------------------
+1. Start the server
+---------------------------------------------------------------------------
+
+----------------------------------------------------------------------
+1. START THE SERVER (run in its own terminal)
+----------------------------------------------------------------------
+  source $VLLM_ROOT/.venv/bin/activate
+
+  vllm serve $MODEL \
+    --port $PORT \
+    --gpu-memory-utilization 0.30 \
+    --max-model-len 2048 \
+    --max-num-seqs 64
+
+Flags worth knowing:
+  --gpu-memory-utilization   fraction of the SHARED GB10 pool (see example 00)
+  --max-model-len            caps context, caps KV per sequence
+  --max-num-seqs             concurrency ceiling
+  --enable-prefix-caching    on by default in V1; --no-enable-prefix-caching to disable
+  --kv-cache-dtype fp8       halve KV cache size
+  --quantization fp8         quantize weights on load
+  --api-key SECRET           require an Authorization header
+  --served-model-name NAME   decouple the API-facing name from the checkpoint path
+  --tensor-parallel-size N   N>1 is not usable here (single GPU)
+  --disable-log-requests     quieter logs; you lose per-request visibility
+
+---------------------------------------------------------------------------
+2. Health and readiness
+---------------------------------------------------------------------------
+----------------------------------------------------------------------
+2. HEALTH / READINESS — what k8s probes hit
+----------------------------------------------------------------------
+  curl -s localhost:$PORT/health          # liveness; 200 once the engine is up
+  curl -s localhost:$PORT/v1/models | jq  # readiness + the served model name
+
+These two endpoints are exactly what you saw flooding the logs of the abandoned
+sglang/vllm pods every 10s. Health-check traffic looks identical to real traffic
+in a request-count graph, which is why those deployments sat idle for 37 days
+without anyone noticing. If you build dashboards, EXCLUDE probe endpoints or you
+will not be able to tell a live service from a dead one.
+
+---------------------------------------------------------------------------
+3. Make requests
+---------------------------------------------------------------------------
+----------------------------------------------------------------------
+3. REQUESTS
+----------------------------------------------------------------------
+  # completion
+  curl -s localhost:$PORT/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"$MODEL","prompt":"A data center is","max_tokens":32}' | jq -r '.choices[0].text'
+
+  # chat (instruct models)
+  curl -s localhost:$PORT/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"$MODEL","messages":[{"role":"user","content":"hi"}],"max_tokens":32}' | jq
+
+  # streaming — watch tokens arrive, this is what TTFT measures
+  curl -N -s localhost:$PORT/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"$MODEL","prompt":"Explain paged attention:","max_tokens":64,"stream":true}'
+
+  # built-in CLI clients
+  vllm complete --url http://localhost:$PORT/v1 --model $MODEL
+  vllm chat     --url http://localhost:$PORT/v1 --model $MODEL
+
+---------------------------------------------------------------------------
+4. Benchmarks
+---------------------------------------------------------------------------
+----------------------------------------------------------------------
+4. BENCHMARKS — vllm bench
+----------------------------------------------------------------------
+Subcommands: latency | throughput | serve | startup | sweep | mm-processor
+
+  # (a) Offline max throughput — the "how much can this box do" number
+  vllm bench throughput --model $MODEL \
+    --input-len 512 --output-len 128 --num-prompts 256 \
+    --gpu-memory-utilization 0.30
+
+  # (b) Single-batch latency — decode step cost, no queueing
+  vllm bench latency --model $MODEL \
+    --input-len 512 --output-len 128 --batch-size 8 \
+    --gpu-memory-utilization 0.30
+
+  # (c) THE IMPORTANT ONE — online serving against a running server.
+  #     Poisson arrivals at a fixed rate; reports TTFT/ITL/E2E percentiles.
+  vllm bench serve --backend vllm --model $MODEL \
+    --host localhost --port $PORT \
+    --dataset-name random --random-input-len 512 --random-output-len 128 \
+    --num-prompts 200 --request-rate 10
+
+  # (d) Find the saturation point: sweep request rate until p99 TTFT breaks SLA.
+  for rate in 1 2 5 10 20 40 inf; do
+    echo "=== request-rate=$rate ==="
+    vllm bench serve --backend vllm --model $MODEL \
+      --host localhost --port $PORT \
+      --dataset-name random --random-input-len 512 --random-output-len 128 \
+      --num-prompts 200 --request-rate $rate 2>&1 | grep -E 'Throughput|TTFT|TPOT|ITL'
+  done
+
+  # (e) Startup time — matters for autoscaling and rollouts, since a cold replica
+  #     is useless until weights are loaded and graphs captured.
+  vllm bench startup --model $MODEL
+
+----------------------------------------------------------------------
+5. HOW TO READ THE RESULTS
+----------------------------------------------------------------------
+  request-rate=inf     saturation test: offered load is unbounded, so you are
+                       measuring maximum throughput, and latency is meaningless.
+  finite request-rate  the realistic mode. Watch for the knee where p99 TTFT
+                       climbs sharply — that is your per-replica capacity, and
+                       what you divide expected traffic by to size the fleet.
+
+  TTFT climbing while throughput is flat  -> queueing; add replicas
+  ITL climbing                            -> batch too large; lower max_num_seqs
+  Throughput collapsing under load        -> KV cache exhaustion and preemption;
+                                             check engine logs for "Preempted"
+
+Capacity planning is: pick an SLA (e.g. p99 TTFT < 500ms), find the request rate
+where a single replica breaks it, then replicas = peak_rps / that_rate, plus
+headroom for rollouts and failure.
+
+echo
+echo "Note: on GB10 leave meaningful headroom — the OS shares the memory pool,"
+echo "and a benchmark that starves the host will look like an inference problem."
